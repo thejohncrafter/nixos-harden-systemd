@@ -1,0 +1,299 @@
+#!/usr/bin/env oil
+
+proc discover-systemd-services(nixpkgs, output) {
+  m = $(nix-instantiate --eval -E "$nixpkgs/nixos/modules/module-list.nix")
+  dir = $(nix-instantiate --eval -E "$nixpkgs/nixos/modules")
+  modules = split($(cat $m | grep '^ *\./services' | awk -v prepend=$dir '{sub(/^ *\.\//,""); printf prepend; printf "/"; print}'))
+
+  const n = len(modules)
+  var i = 0
+  var k = 0
+  var success = 0
+  var targets = []
+  for module in @modules {
+    setvar i = i + 1
+    write -n "$i/$n... "
+    if ! nix-codemod list-systemd-services $module 2>/dev/null | json read serviceNames 2> /dev/null {
+      write "✗"
+    } else {
+      write "✓"
+      setvar success = success + 1
+      setvar k = k + len(serviceNames)
+      for service in @serviceNames {
+        nix-codemod print-systemd-service-config $module $service | json read blank
+        setvar targets = targets + [{ module: $module, service: $service, blank: blank }]
+      }
+    }
+  }
+
+  json write (targets) > $output
+
+  write "$success ($(($success*100/$n))%) succeeded"
+  write "$k services discovered"
+}
+
+proc test-deps(nixpkgs, output) {
+  nix-instantiate --eval -E "(import ./printInfo.nix { pkgs = import $nixpkgs {}; }).allTests" --json | json read testNames
+  const n = len(testNames)
+  var i = 0
+  var assoc = []
+  for test in @testNames {
+    write -n "$test ($[i + 1]/$n)... "
+    if ! nix-instantiate --eval -E "(import ./printInfo.nix { pkgs = import $nixpkgs {}; }).testDeps \"$test\"" --json 2> /dev/null | json read deps 2> /dev/null {
+      write "Couldn't evaluate"
+    } else {
+      setvar assoc = assoc + [{ test: $test, deps: deps }]
+      write "$[len(deps)] systemd services found"
+    }
+    setvar i = i + 1
+  }
+
+  json write (assoc) > $output
+
+  exit 0
+}
+
+proc find-malformed-tests(nixpkgs, output) {
+  nix-codemod find-all-tests $nixpkgs/nixos/tests/all-tests.nix | json read testFiles
+  const paths = testFiles['paths']
+  const failures = testFiles['failures']
+
+  const args = '{ system = builtins.currentSystem; pkgs = import <nixpkgs> {}; systemdPassthru = {}; }'
+
+  var failed = []
+  setvar failed = failures + failed
+
+  var i = 0
+  var f = 0
+  while (i < len(paths)) {
+    var test = paths[i][0]
+    var path = "$nixpkgs/nixos/tests/$[paths[i][1]]"
+    setvar i = i + 1
+    if test -f $path {
+      nix-codemod is-test-well-formed $path | read status
+      if (status === "false") {
+        # check if it accepts "systemdPassthru"
+        if ! nix-instantiate --eval -E "(import $path) $args" > /dev/null 2> /dev/null {
+          setvar f = f + 1
+          write "***** $test ($path)"
+          head -n 10 $path
+          write ""
+
+          setvar failed = [ $test ] + failed
+        }
+      }
+    }
+  }
+
+  json write (failed) > $output
+
+  write "$f/$[len(paths)] failed"
+}
+
+proc collect-tests(systemdServices, testDeps, output) {
+  cat $systemdServices | json read services
+  cat $testDeps | jq '[.[].test]' | json read testNames
+  cat $output | json read deps
+
+  var assoc = {}
+  
+  var i = 0
+  while (i < len(services)) {
+    var service = services[i]
+    setvar i = i + 1
+    write -n "$i/$[len(services)]... "
+    var testedby = []
+
+    ... cat $testDeps
+      | jq --arg service $[service["service"]] '[.[] | select(.deps[] == $service) | .test]'
+      | json read testedby
+      ;
+    
+    setvar assoc[service["service"]] = { module: service["module"], fields: service["blank"], tests: testedby }
+
+    write -n "$[service['service']] ($[service['module']]) is tested by"
+    
+    for test in @testedby {
+      write -n " $test"
+    }
+
+    write ""
+  }
+
+  json write (assoc) > $output
+}
+
+proc hook-modules(nixpkgs, collectedtests) {
+  cat $collectedtests | json read tests
+  cat $collectedtests | jq 'keys' | json read keys
+  mktemp -d | read tmp
+  trap "rm -rf -- $tmp" EXIT
+
+  cp ./all-tests-hooked.nix $nixpkgs/nixos/tests/all-tests.nix
+  cp ./make-test-python-hooked.nix $nixpkgs/nixos/tests/make-test-python.nix
+
+  var i = 0
+  while (i < len(keys)) {
+    var service = keys[i]
+    setvar i = i + 1
+    var info = tests[service]
+    var module = info["module"]
+
+    json write (info['fields']) > $tmp/fields.json
+
+    if ! nix-codemod insert-systemd-hooks $module $service $tmp/fields.json > $tmp/val {
+      write "failed @ $module"
+    } else {
+      cat $tmp/val > $module
+    }
+
+    write -n $'\r'
+    write -n "$i/$[len(keys)]"
+  }
+}
+
+proc run-specific-tests(tests, nixpkgs, malformed, opts, service, dryRun) {
+  # nix-instantiate --eval --strict -E "builtins.attrNames (((import ./printInfo.nix {}).mkOverridableTests ./output/tests ./output/nixpkgs).nginx { PrivateNetwork = true; })" --show-trace
+
+  const excluded = "(builtins.fromJSON (builtins.readFile excluded))"
+  const info = "((import ./printInfo.nix {}).mkOverridableTests $tests $nixpkgs $excluded).\"\${service}\""
+  const options = "(builtins.fromJSON (builtins.readFile options))"
+  ... nix-instantiate --eval --json
+    --arg service "\"$service\""
+    --arg options $opts
+    --arg excluded $malformed
+    -E "{ service, options, excluded }: builtins.length ($info $options)"
+    --show-trace
+    | json read n
+    ;
+
+  var extraOpts = []
+  if ($dryRun === "true") {
+    setvar extraOpts = [ "--dry-run" ]
+  }
+
+  var i = 0
+  while (i < n) {
+    write "$i/$n"
+    ... nix-build @extraOpts
+      --arg service "\"$service\""
+      --arg options $opts
+      --arg excluded $malformed
+      --arg i $i
+      -E "{ service, options, i, excluded }: (builtins.elemAt ($info $options) i).value"
+      ;
+    setvar i = i + 1;
+  }
+}
+
+proc dry-run-all-tests(collectedtests, nixpkgs, malformed, opts) {
+  cat $collectedtests | jq 'keys' | json read keys
+
+  write "" > failed
+  write 'writing every failure to "failed"'
+
+  var i = 0
+  while (i < len(keys)) {
+    var service = keys[i]
+    setvar i = i + 1
+    write -n $'\r'
+    write -n "$i/$[len(keys)]"
+    if ! try run-specific-tests $collectedtests $nixpkgs $opts $malformed $service true 2> /dev/null {
+      write -n $'\r'
+      write -n "           "
+      write -n $'\r'
+      write $service
+      write $service >> failed
+    }
+  }
+}
+
+usage () {
+  echo "Usage"
+  write "$0 discover-systemd-services <nixpkgs> <output>"
+  write "  For each NixOS service, find the systemd services it declares"
+  write "$0 test-deps <nixpkgs> <output>"
+  write "  Computes for each test the systemd services it depends on,"
+  write "  and *writes* the result in <output>"
+  write "$0 find-malformed-tests <nixpkgs> <output>"
+  write "  Parses <nixpkgs/nixos/tests/all-tests>, and check which tests can support"
+  write "  the 'systemdPassthru' hooks"
+  write "$0 collect-tests <systemd-services> <test-deps> <output>"
+  write "  For each systemd service, computes all the tests that depend on it,"
+  write "  and *writes* the result in <output>"
+  write "$0 hook-modules <nixpkgs> <collected-tests>"
+  write "  Adds hooks to every module in the given nixpkgs source folder"
+  write "$0 run-specific-test <nixpkgs> <collected-tests> <malformed> <options-file> <service>"
+  write "$0 dry-run-all-tests <nixpkgs> <collected-tests> <malformed> <options-file>"
+
+  # nix-build -E "(((import ./printInfo.nix {}).mkOverridableTests ./output/tests ./output/nixpkgs).hydra-server { PrivateNetwork = false; }).hydra.hydra-unstable.test"
+
+  exit 1
+}
+
+if (len(ARGV) === 0) {
+  usage
+}
+
+case $[ARGV[0]] in
+  "discover-systemd-services")
+    if (len(ARGV) === 3) {
+      discover-systemd-services $[ARGV[1]] $[ARGV[2]]
+    } else {
+      usage
+    }
+    ;;
+  "test-deps")
+    if (len(ARGV) === 3) {
+      test-deps $[ARGV[1]] $[ARGV[2]]
+    } else {
+      usage
+    }
+    ;;
+  "find-malformed-tests")
+    if (len(ARGV) === 3) {
+      find-malformed-tests $[ARGV[1]] $[ARGV[2]]
+    } else {
+      usage
+    }
+    ;;
+  "collect-tests")
+    if (len(ARGV) === 4) {
+      collect-tests $[ARGV[1]] $[ARGV[2]] $[ARGV[3]]
+    } else {
+      usage
+    }
+    ;;
+  "hook-modules")
+    if (len(ARGV) === 3) {
+      hook-modules $[ARGV[1]] $[ARGV[2]]
+    } else {
+      usage
+    }
+    ;;
+  "dry-run-specific-tests")
+    if (len(ARGV) === 6) {
+      run-specific-tests $[ARGV[1]] $[ARGV[2]] $[ARGV[3]] $[ARGV[4]] $[ARGV[5]] "true"
+    } else {
+      usage
+    }
+    ;;
+  "run-specific-tests")
+    if (len(ARGV) === 6) {
+      run-specific-tests $[ARGV[1]] $[ARGV[2]] $[ARGV[3]] $[ARGV[4]] $[ARGV[5]] "false"
+    } else {
+      usage
+    }
+    ;;
+  "dry-run-all-tests")
+    if (len(ARGV) === 5) {
+      dry-run-all-tests $[ARGV[1]] $[ARGV[2]] $[ARGV[3]] $[ARGV[5]]
+    } else {
+      usage
+    }
+    ;;
+  *)
+    usage
+    ;;
+esac
+

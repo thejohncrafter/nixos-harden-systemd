@@ -1,0 +1,5 @@
+.direnv
+result
+output
+options.json
+nix-codemod/target

@@ -1,0 +1,6 @@
+
+3proxy
+ModemManager
+NetworkManager
+NetworkManager-dispatcher
+NetworkManager-wait-online
